@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -60,5 +61,41 @@ func TestSetProviderIDAgainstAPIServer(t *testing.T) {
 	}
 	if err := c.SetProviderID(ctx, name, "wol://a"); err != nil {
 		t.Fatalf("setting the same providerID again: %v", err)
+	}
+
+	// The power-off annotation round-trips, and removing the deletion taint keeps other taints.
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := c.SetPowerOff(ctx, name, at); err != nil {
+		t.Fatal(err)
+	}
+	node, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.Spec.Taints = []corev1.Taint{{Key: ToBeDeletedTaint, Value: "1", Effect: corev1.TaintEffectNoSchedule},
+		{Key: "example.com/keep", Effect: corev1.TaintEffectNoSchedule}}
+	if _, err := cs.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	nodes, _ = c.List(ctx)
+	if n = nodes[name]; !n.PowerOffAt.Equal(at) || !n.ToBeDeleted {
+		t.Fatalf("after annotate and taint: %+v", n)
+	}
+	if err := c.RemoveTaint(ctx, name, ToBeDeletedTaint); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPowerOff(ctx, name, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	node, _ = cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if _, ok := node.Annotations[PowerOffAnnotation]; ok || len(node.Spec.Taints) != 1 || node.Spec.Taints[0].Key != "example.com/keep" {
+		t.Fatalf("after clearing: annotations %v taints %v", node.Annotations, node.Spec.Taints)
+	}
+	// Both are no-ops on a node that's gone.
+	if err := c.RemoveTaint(ctx, "wol-provider-test-missing", ToBeDeletedTaint); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPowerOff(ctx, "wol-provider-test-missing", time.Time{}); err != nil {
+		t.Fatal(err)
 	}
 }

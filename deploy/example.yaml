@@ -8,8 +8,11 @@ metadata:
   namespace: kube-system
 ---
 # The provider reads nodes; patches a matched node's empty spec.providerID (once: the API server
-# refuses any later change); and removes the Node object of a machine it has powered off, so the
-# node doesn't sit NotReady (the kubelet registers it again on the next boot).
+# refuses any later change); records a power-off as an annotation, and on a failed power-off removes
+# Cluster Autoscaler's deletion taint; and removes the Node object of a machine it has powered off, so
+# the node doesn't sit NotReady (the kubelet registers it again on the next boot).
+#
+# RBAC can't limit these to some nodes or some fields; the ValidatingAdmissionPolicy below does.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -17,7 +20,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [nodes]
-    verbs: [get, list, watch, patch, delete]
+    verbs: [list, get, patch, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -32,6 +35,52 @@ subjects:
     name: wol-provider
     namespace: kube-system
 ---
+# Limits what the provider's service account can do to nodes (Kubernetes 1.30+):
+#   - change nothing but spec.providerID (from empty), its own power-off annotation, and removing taints;
+#   - delete only a node whose machine it is powering off (the node carries its annotation).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: wol-provider-nodes
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [UPDATE, DELETE]
+        resources: [nodes]
+  matchConditions:
+    - name: provider-only
+      expression: request.userInfo.username == 'system:serviceaccount:kube-system:wol-provider'
+  variables:
+    - name: ann
+      expression: "'wol-provider/power-off-requested'"
+  validations:
+    - expression: >-
+        request.operation != 'DELETE' ||
+        (has(oldObject.metadata.annotations) && variables.ann in oldObject.metadata.annotations)
+      message: the provider may delete only a node it is powering off
+    - expression: >-
+        request.operation != 'UPDATE' || (
+          object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+          object.spec.?unschedulable.orValue(false) == oldObject.spec.?unschedulable.orValue(false) &&
+          object.spec.?podCIDR.orValue('') == oldObject.spec.?podCIDR.orValue('') &&
+          object.spec.?taints.orValue([]).all(t, oldObject.spec.?taints.orValue([]).exists(o, o.key == t.key && o.effect == t.effect)) &&
+          object.metadata.?annotations.orValue({}).all(k, k == variables.ann ||
+            (k in oldObject.metadata.?annotations.orValue({}) && oldObject.metadata.annotations[k] == object.metadata.annotations[k])) &&
+          oldObject.metadata.?annotations.orValue({}).all(k, k == variables.ann || k in object.metadata.?annotations.orValue({}))
+        )
+      message: the provider may only set spec.providerID, its power-off annotation, and remove taints
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: wol-provider-nodes
+spec:
+  policyName: wol-provider-nodes
+  validationActions: [Deny]
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -39,21 +88,20 @@ metadata:
   namespace: kube-system
 data:
   config.yaml: |
-    talos:
-      caFile: /etc/wol-provider/talos/ca.crt
-      certFile: /etc/wol-provider/talos/tls.crt
-      keyFile: /etc/wol-provider/talos/tls.key
+    defaults:
+      powerOn:
+        wol: {broadcast: "192.0.2.255:9"}
+      powerOff:
+        ssh: {user: autoscaler, keyFile: /etc/wol-provider/ssh/id_ed25519, knownHostsFile: /etc/wol-provider/ssh/known_hosts}
     nodeGroups:
-      - id: gpu
+      - id: batch
         minSize: 0
         maxSize: 1
         machines:
           - node: node-a
-            powerOn: wol
-            mac: "00:00:5e:00:53:01"
-            broadcast: "192.0.2.255:9"
-            powerOff: talos
-            talosEndpoint: "192.0.2.11:50000"
+            powerOn: {wol: {mac: "00:00:5e:00:53:01"}}
+            powerOff: {ssh: {host: 192.0.2.11}}
+            probe: {tcp: {address: "192.0.2.11:22"}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -62,6 +110,8 @@ metadata:
   namespace: kube-system
 spec:
   replicas: 1
+  # hostNetwork holds the ports on the node: the old pod must go before the new one can start.
+  strategy: {type: Recreate}
   selector:
     matchLabels: {app: wol-provider}
   template:
@@ -70,7 +120,9 @@ spec:
     spec:
       serviceAccountName: wol-provider
       # A broadcast only reaches the subnet the sender is on: run on a node in the machines' subnet.
-      # With a directed broadcast the router forwards, hostNetwork isn't needed.
+      # With a directed broadcast the router forwards, hostNetwork isn't needed. With hostNetwork the
+      # gRPC port listens on the node's address: mutual TLS keeps it closed to anyone without a
+      # client certificate.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       # Never on a machine this provider can power off.
@@ -78,15 +130,20 @@ spec:
         example.com/always-on: "true"
       containers:
         - name: wol-provider
-          image: ghcr.io/oldsj/cluster-autoscaler-wol-provider:0.2.0 # or pin the digest
+          image: ghcr.io/oldsj/cluster-autoscaler-wol-provider:0.3.0 # or pin the digest
           args:
             - --config=/etc/wol-provider/config.yaml
             - --listen=:8086
+            - --health-listen=:8087
+            - --tls-cert-file=/etc/wol-provider/tls/tls.crt
+            - --tls-key-file=/etc/wol-provider/tls/tls.key
+            - --tls-client-ca-file=/etc/wol-provider/tls/ca.crt
             - --dry-run # remove once the logs show the decisions you expect
           ports:
             - {name: grpc, containerPort: 8086}
+            - {name: health, containerPort: 8087}
           readinessProbe:
-            grpc: {port: 8086}
+            grpc: {port: 8087}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -97,14 +154,19 @@ spec:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {memory: 128Mi}
           volumeMounts:
-            - {name: config, mountPath: /etc/wol-provider, readOnly: true}
-            - {name: talos, mountPath: /etc/wol-provider/talos, readOnly: true}
+            - {name: config, mountPath: /etc/wol-provider/config.yaml, subPath: config.yaml, readOnly: true}
+            - {name: tls, mountPath: /etc/wol-provider/tls, readOnly: true}
+            - {name: ssh, mountPath: /etc/wol-provider/ssh, readOnly: true}
       volumes:
         - name: config
           configMap: {name: wol-provider}
-        # ca.crt, tls.crt and tls.key of a Talos client certificate with role os:operator.
-        - name: talos
-          secret: {secretName: wol-provider-talos}
+        # Server certificate (tls.crt, tls.key) and the CA that signs Cluster Autoscaler's client
+        # certificate (ca.crt), for example from cert-manager.
+        - name: tls
+          secret: {secretName: wol-provider-tls}
+        # The ssh private key (id_ed25519) and known_hosts for the "ssh" power-off plugin.
+        - name: ssh
+          secret: {secretName: wol-provider-ssh, defaultMode: 0400}
 ---
 apiVersion: v1
 kind: Service
@@ -118,6 +180,7 @@ spec:
 ---
 # Cluster Autoscaler's cloud config: run it with
 #   --cloud-provider=externalgrpc --cloud-config=/etc/cluster-autoscaler/cloud-config.yaml
+# and mount its client certificate (signed by the CA in wol-provider-tls) at /etc/cluster-autoscaler/tls.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -127,4 +190,6 @@ data:
   cloud-config.yaml: |
     address: wol-provider.kube-system.svc:8086
     grpc_timeout: 30s
-    # For mTLS (recommended): key, cert and cacert, with the provider's --tls-* flags.
+    cert: /etc/cluster-autoscaler/tls/tls.crt
+    key: /etc/cluster-autoscaler/tls/tls.key
+    cacert: /etc/cluster-autoscaler/tls/ca.crt

@@ -24,6 +24,21 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - run: go build ./cmd/wol-provider
+      - name: cross-build (linux, darwin, windows)
+        run: for os in linux darwin windows; do GOOS=$os go build -o /dev/null ./cmd/wol-provider; done
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      # Built from source at a pinned version, checked against the Go checksum database.
+      - name: golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
 
   # The API server's providerID rule (set once, from empty) that the provider relies on, against a
   # real API server in a disposable kind cluster.
@@ -41,12 +56,14 @@ jobs:
         run: |
           kind get kubeconfig --name wol-provider-test > "$RUNNER_TEMP/kubeconfig"
           WOL_PROVIDER_TEST_KUBECONFIG="$RUNNER_TEMP/kubeconfig" go test -count=1 -v -run APIServer ./internal/kube
+      - name: deploy/example.yaml node policy (RBAC + ValidatingAdmissionPolicy)
+        run: hack/test-node-policy.sh
 
   # Builds on every pull request; on main and on v* tags, pushes a linux/amd64 + linux/arm64 image to
   # ghcr.io/oldsj/cluster-autoscaler-wol-provider. Tags: main and sha-<commit> from main; <version>,
   # <major>.<minor> and latest from a vX.Y.Z tag.
   image:
-    needs: [test, apiserver]
+    needs: [test, lint, apiserver]
     runs-on: ubuntu-latest
     permissions:
       contents: read

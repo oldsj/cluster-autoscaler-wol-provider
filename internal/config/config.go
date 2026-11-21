@@ -3,8 +3,8 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"time"
 
@@ -26,24 +26,87 @@ type Config struct {
 	// GPULabel is the node label Cluster Autoscaler uses to recognise GPU nodes. Optional.
 	GPULabel string `json:"gpuLabel,omitempty"`
 	// BootTimeout is how long a woken machine may take to register as a node before it's no longer
-	// counted as starting. Keep Cluster Autoscaler's --max-node-provision-time at or below it.
-	// Default 15m.
+	// counted as starting. Keep Cluster Autoscaler's --max-node-provision-time below it. Default 20m.
 	BootTimeout Duration `json:"bootTimeout,omitempty"`
+	// WakeResendInterval is how often the power-on is sent again while a woken machine hasn't
+	// registered, since a magic packet can be lost or arrive while the machine is still shutting
+	// down. Default 30s.
+	WakeResendInterval Duration `json:"wakeResendInterval,omitempty"`
+	// MinOffTime is how long a machine stays off before it may be woken again, so a power-on doesn't
+	// arrive mid-shutdown. Default 1m.
+	MinOffTime Duration `json:"minOffTime,omitempty"`
+	// PowerOffTimeout bounds one power-off plugin call. It runs apart from Cluster Autoscaler's
+	// request, which only waits for it up to its own deadline. Default 2m.
+	PowerOffTimeout Duration `json:"powerOffTimeout,omitempty"`
 	// ShutdownTimeout is how long a machine may stay Ready after its power-off was requested before
-	// that's logged as a failure. Default 5m.
+	// that's treated as a failure: the provider then removes Cluster Autoscaler's deletion taint so
+	// the node is usable again. Default 5m.
 	ShutdownTimeout Duration `json:"shutdownTimeout,omitempty"`
-	// Talos holds the client certificate used by the "talos" power-off method.
-	Talos *TalosCredentials `json:"talos,omitempty"`
+	// NotReadyGrace is how long a node may be NotReady, with no probe saying its machine is up,
+	// before the machine counts as off (crashed, or switched off by hand) and may be woken.
+	// Default 10m.
+	NotReadyGrace Duration `json:"notReadyGrace,omitempty"`
+	// ProbeInterval is how often machines with a probe are probed. Default 15s.
+	ProbeInterval Duration `json:"probeInterval,omitempty"`
+	// Defaults are settings shared by every machine that uses a plugin, by plugin name; a machine's
+	// own settings override them key by key. For example the Talos client certificate, or the SSH
+	// user and key.
+	Defaults Defaults `json:"defaults,omitempty"`
+	// Approval, if set, must approve each power-off. Off by default.
+	Approval *Approval `json:"approval,omitempty"`
 	// NodeGroups are the groups Cluster Autoscaler may scale.
 	NodeGroups []NodeGroup `json:"nodeGroups"`
 }
 
-// TalosCredentials are file paths, typically a mounted Kubernetes Secret. The certificate needs a
-// Talos role that may call Shutdown (os:operator or above).
-type TalosCredentials struct {
-	CAFile   string `json:"caFile"`
-	CertFile string `json:"certFile"`
-	KeyFile  string `json:"keyFile"`
+// Defaults are per-plugin shared settings.
+type Defaults struct {
+	PowerOn  map[string]json.RawMessage `json:"powerOn,omitempty"`
+	PowerOff map[string]json.RawMessage `json:"powerOff,omitempty"`
+	Probe    map[string]json.RawMessage `json:"probe,omitempty"`
+}
+
+// Approval is a hook asked before each power-off; see the README.
+type Approval struct {
+	// HTTP is the request, with the http plugin's settings.
+	HTTP json.RawMessage `json:"http"`
+	// Wait is how long one scale-down call waits for a pending approval before failing, so Cluster
+	// Autoscaler rolls back and asks again later. Keep it under Cluster Autoscaler's grpc_timeout.
+	// Default 20s.
+	Wait Duration `json:"wait,omitempty"`
+	// PollInterval is how often a pending approval is checked while waiting. Default 2s.
+	PollInterval Duration `json:"pollInterval,omitempty"`
+	// Expire is how long a pending or approved answer is kept for the next attempt; after it, the
+	// next scale-down asks again. Default 1h.
+	Expire Duration `json:"expire,omitempty"`
+}
+
+// Plugin selects one plugin by name, with its settings: written {wol: {mac: ...}} in YAML.
+type Plugin struct {
+	Name     string
+	Settings json.RawMessage
+}
+
+// UnmarshalJSON reads an object with exactly one key, the plugin name.
+func (p *Plugin) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("want {<plugin>: {settings}}: %w", err)
+	}
+	if len(m) != 1 {
+		return fmt.Errorf("want exactly one plugin, {<plugin>: {settings}}, got %d keys", len(m))
+	}
+	for k, v := range m {
+		p.Name, p.Settings = k, v
+	}
+	return nil
+}
+
+// MarshalJSON writes the one-key form back.
+func (p Plugin) MarshalJSON() ([]byte, error) {
+	if p.Name == "" {
+		return []byte("null"), nil
+	}
+	return json.Marshal(map[string]json.RawMessage{p.Name: p.Settings})
 }
 
 // NodeGroup is a set of existing machines that are switched on and off as a group grows and shrinks.
@@ -79,15 +142,23 @@ type Machine struct {
 	// its kubelet or another controller): give that value here, and the provider uses it as-is.
 	// Empty means ProviderIDPrefix + Name.
 	ProviderID string `json:"providerID,omitempty"`
-	// PowerOn is the method used to start it: "wol".
-	PowerOn string `json:"powerOn"`
-	// PowerOff is the method used to stop it: "talos" or "ssh" (not implemented yet).
-	PowerOff string `json:"powerOff"`
-	// MAC and Broadcast are for "wol". Broadcast is host:port; default 255.255.255.255:9.
-	MAC       string `json:"mac,omitempty"`
-	Broadcast string `json:"broadcast,omitempty"`
-	// TalosEndpoint is the machine's Talos API, host:port, for "talos".
-	TalosEndpoint string `json:"talosEndpoint,omitempty"`
+	// PowerOn is the plugin that starts the machine, for example {wol: {mac: ...}}.
+	PowerOn Plugin `json:"powerOn"`
+	// PowerOff is the plugin that stops it, for example {ssh: {host: ...}}.
+	PowerOff Plugin `json:"powerOff"`
+	// Probe is an optional plugin that tells whether the machine is up apart from its node, for
+	// example {tcp: {address: ...}}. Without one, the node's Ready condition is all the provider
+	// goes by.
+	Probe *Plugin `json:"probe,omitempty"`
+}
+
+// InstanceID is the ID Cluster Autoscaler knows a machine by: its providerID, or the prefix and its
+// name.
+func (c *Config) InstanceID(m *Machine) string {
+	if m.ProviderID != "" {
+		return m.ProviderID
+	}
+	return c.ProviderIDPrefix + m.Name
 }
 
 // Duration is a time.Duration written as "10m" in YAML.
@@ -102,6 +173,9 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	v, err := time.ParseDuration(s[1 : len(s)-1])
 	if err != nil {
 		return err
+	}
+	if v < 0 {
+		return fmt.Errorf("duration %s is negative", v)
 	}
 	d.Duration = v
 	return nil
@@ -125,12 +199,35 @@ func Parse(b []byte) (*Config, error) {
 	if c.ProviderIDPrefix == "" {
 		c.ProviderIDPrefix = "wol://"
 	}
-	if c.BootTimeout.Duration == 0 {
-		c.BootTimeout.Duration = 15 * time.Minute
+	for _, d := range []struct {
+		v   *Duration
+		def time.Duration
+	}{
+		{&c.BootTimeout, 20 * time.Minute},
+		{&c.WakeResendInterval, 30 * time.Second},
+		{&c.MinOffTime, time.Minute},
+		{&c.PowerOffTimeout, 2 * time.Minute},
+		{&c.NotReadyGrace, 10 * time.Minute},
+		{&c.ProbeInterval, 15 * time.Second},
+	} {
+		if d.v.Duration == 0 {
+			d.v.Duration = d.def
+		}
 	}
 	if c.AssignProviderIDs == nil {
 		t := true
 		c.AssignProviderIDs = &t
+	}
+	if a := c.Approval; a != nil {
+		if a.Wait.Duration == 0 {
+			a.Wait.Duration = 20 * time.Second
+		}
+		if a.PollInterval.Duration == 0 {
+			a.PollInterval.Duration = 2 * time.Second
+		}
+		if a.Expire.Duration == 0 {
+			a.Expire.Duration = time.Hour
+		}
 	}
 	if c.ShutdownTimeout.Duration == 0 {
 		c.ShutdownTimeout.Duration = 5 * time.Minute
@@ -145,9 +242,13 @@ func (c *Config) validate() error {
 	if len(c.NodeGroups) == 0 {
 		return fmt.Errorf("no nodeGroups")
 	}
+	if c.Approval != nil && len(c.Approval.HTTP) == 0 {
+		return fmt.Errorf("approval: http is required")
+	}
 	groups := map[string]bool{}
 	nodes := map[string]bool{}
 	names := map[string]bool{}
+	ids := map[string]string{} // instance ID -> machine
 	for i := range c.NodeGroups {
 		g := &c.NodeGroups[i]
 		if g.ID == "" {
@@ -196,38 +297,23 @@ func (c *Config) validate() error {
 			if err := c.validateMachine(m); err != nil {
 				return fmt.Errorf("machine %q: %w", m.Name, err)
 			}
+			id := c.InstanceID(m)
+			if other, ok := ids[id]; ok {
+				return fmt.Errorf("machines %q and %q have the same instance ID %q", other, m.Name, id)
+			}
+			ids[id] = m.Name
 		}
 	}
 	return nil
 }
 
 func (c *Config) validateMachine(m *Machine) error {
-	switch m.PowerOn {
-	case "wol":
-		if _, err := net.ParseMAC(m.MAC); err != nil {
-			return fmt.Errorf("mac: %w", err)
-		}
-		if m.Broadcast == "" {
-			m.Broadcast = "255.255.255.255:9"
-		}
-		if _, _, err := net.SplitHostPort(m.Broadcast); err != nil {
-			return fmt.Errorf("broadcast: %w", err)
-		}
-	default:
-		return fmt.Errorf("powerOn %q: want wol", m.PowerOn)
+	// The plugins check their own settings when they're built, at startup.
+	if m.PowerOn.Name == "" {
+		return fmt.Errorf("powerOn is required")
 	}
-	switch m.PowerOff {
-	case "talos":
-		if c.Talos == nil {
-			return fmt.Errorf("powerOff talos needs the top-level talos credentials")
-		}
-		if _, _, err := net.SplitHostPort(m.TalosEndpoint); err != nil {
-			return fmt.Errorf("talosEndpoint: %w", err)
-		}
-	case "ssh":
-		// Accepted so a config can name it; the method itself returns an error until it's written.
-	default:
-		return fmt.Errorf("powerOff %q: want talos or ssh", m.PowerOff)
+	if m.PowerOff.Name == "" {
+		return fmt.Errorf("powerOff is required")
 	}
 	return nil
 }

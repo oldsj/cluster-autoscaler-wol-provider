@@ -1,5 +1,11 @@
 # Example provider configuration. Addresses are from the documentation ranges (RFC 5737, RFC 7042);
 # replace them with your own.
+#
+# Each machine names one plugin for powerOn and one for powerOff, and optionally a probe:
+#   powerOn:  wol | http | exec
+#   powerOff: ssh | talos | http | exec
+#   probe:    tcp | icmp            (without one, only the node's Ready condition counts)
+# The README documents every plugin's settings.
 
 # Instance ID = prefix + machine name. The provider sets it as spec.providerID on each matched node
 # whose providerID is empty; no kubelet flag needed. A node that already has a providerID keeps it:
@@ -7,27 +13,75 @@
 providerIDPrefix: wol://
 assignProviderIDs: true
 # How long a woken machine has to register before it stops counting as starting. Keep Cluster
-# Autoscaler's --max-node-provision-time at or below this.
-bootTimeout: 15m
-# How long a machine may stay Ready after its power-off was requested before that's logged as a failure.
+# Autoscaler's --max-node-provision-time (default 15m) below this.
+bootTimeout: 20m
+# Power-on is resent this often while a machine is starting.
+wakeResendInterval: 30s
+# A machine that just went off isn't woken again for this long.
+minOffTime: 1m
+# How long one power-off plugin call may take.
+powerOffTimeout: 2m
+# How long a machine may stay Ready after its power-off before the provider gives the node back.
 shutdownTimeout: 5m
+# A node NotReady for this long, with no probe saying the machine is up, counts as off.
+notReadyGrace: 10m
 gpuLabel: nvidia.com/gpu.present
 
-# Client certificate for the "talos" power-off method, typically a mounted Secret. Its role must
-# allow Shutdown: os:operator or os:admin.
-talos:
-  caFile: /etc/wol-provider/talos/ca.crt
-  certFile: /etc/wol-provider/talos/tls.crt
-  keyFile: /etc/wol-provider/talos/tls.key
+# Settings shared by every machine that uses a plugin; a machine's own settings override them key by key.
+defaults:
+  powerOn:
+    wol:
+      # The subnet's broadcast address. From a pod, use hostNetwork on a node in the same subnet,
+      # or a directed broadcast the router forwards.
+      broadcast: "192.0.2.255:9"
+  powerOff:
+    ssh:
+      user: autoscaler
+      keyFile: /etc/wol-provider/ssh/id_ed25519
+      knownHostsFile: /etc/wol-provider/ssh/known_hosts
+    talos:
+      # A client certificate whose role allows Shutdown (os:operator or os:admin).
+      caFile: /etc/wol-provider/talos/ca.crt
+      certFile: /etc/wol-provider/talos/tls.crt
+      keyFile: /etc/wol-provider/talos/tls.key
+
+# Optional: ask an HTTP endpoint before every power-off. 2xx approves, 202 means pending, anything
+# else denies.
+# approval:
+#   http:
+#     url: https://approvals.example.com/power-off?machine={{.Name}}
+#     headerFiles: {Authorization: /etc/wol-provider/approval/token}
+#   wait: 20s
 
 nodeGroups:
+  # 1. Plain Linux: Wake-on-LAN on, ssh "sudo poweroff" off.
+  - id: batch
+    minSize: 0
+    maxSize: 2
+    machines:
+      - node: node-a
+        powerOn: {wol: {mac: "00:00:5e:00:53:01"}}
+        powerOff: {ssh: {host: 192.0.2.11}}
+        probe: {tcp: {address: "192.0.2.11:22"}}
+      # Matched by label instead of node name; the name is the machine's own (instance wol://box-b).
+      # Use a label the kubelet can't set on itself (node-restriction.kubernetes.io/ prefix).
+      - name: box-b
+        nodeSelector:
+          node-restriction.kubernetes.io/machine: box-b
+        powerOn: {wol: {mac: "00:00:5e:00:53:02"}}
+        # The node is a VM on a Windows host: shut the host down, not only the guest.
+        powerOff: {ssh: {host: 192.0.2.12, user: administrator, command: "shutdown.exe /s /t 0"}}
+
+  # 2. Talos: graceful shutdown through the Talos API.
   - id: gpu
     minSize: 0
     maxSize: 1
     # What a node of this group looks like when it registers, so Cluster Autoscaler can scale it up
     # from zero. Match the labels and taints the machine's kubelet registers with.
     template:
+      # Include kubernetes.io/arch: pods that select on it (common) only scale up from zero if it matches.
       labels:
+        kubernetes.io/arch: amd64
         nvidia.com/gpu.present: "true"
       taints:
         - key: example.com/gpu
@@ -39,31 +93,22 @@ nodeGroups:
         pods: "110"
         nvidia.com/gpu: "1"
     machines:
-      - node: node-a
-        powerOn: wol
-        mac: "00:00:5e:00:53:01"
-        # The subnet's broadcast address. From a pod, use hostNetwork on a node in the same subnet,
-        # or a directed broadcast the router forwards.
-        broadcast: "192.0.2.255:9"
-        powerOff: talos
-        talosEndpoint: "192.0.2.11:50000"
+      - node: node-c
+        powerOn: {wol: {mac: "00:00:5e:00:53:03"}}
+        powerOff: {talos: {endpoint: "192.0.2.13:50000"}}
+        probe: {icmp: {host: 192.0.2.13}}
 
-  - id: batch
+  # 3. A machine on a smart plug with an HTTP API, set to power on when AC returns (a BIOS option).
+  #    The plug switches it on; ssh shuts the OS down. Have the plug cut power once the draw drops,
+  #    or point powerOff at a hub endpoint that does both: never cut power to a running OS.
+  - id: render
     minSize: 0
-    maxSize: 2
+    maxSize: 1
     machines:
-      - node: node-b
-        powerOn: wol
-        mac: "00:00:5e:00:53:02"
-        broadcast: "192.0.2.255:9"
-        powerOff: talos
-        talosEndpoint: "192.0.2.12:50000"
-      # Matched by label instead of node name; the name is the machine's own (instance wol://box-c).
-      - name: box-c
-        nodeSelector:
-          example.com/machine: box-c
-        powerOn: wol
-        mac: "00:00:5e:00:53:03"
-        broadcast: "192.0.2.255:9"
-        # Not implemented yet: DeleteNodes fails for this machine until it is.
-        powerOff: ssh
+      - node: node-d
+        powerOn:
+          http:
+            url: http://192.0.2.50/relay/0?turn=on
+            method: GET
+        powerOff: {ssh: {host: 192.0.2.14}}
+        probe: {tcp: {address: "192.0.2.14:22"}}
