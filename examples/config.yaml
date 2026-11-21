@@ -1,0 +1,63 @@
+# Example provider configuration. Addresses are from the documentation ranges (RFC 5737, RFC 7042);
+# replace them with your own.
+
+# Instance ID = prefix + node name. Each node's spec.providerID must match (kubelet --provider-id).
+providerIDPrefix: wol://
+# How long a woken machine has to register before it stops counting as starting. Keep Cluster
+# Autoscaler's --max-node-provision-time at or below this.
+bootTimeout: 15m
+# How long a machine may stay Ready after its power-off was requested before that's logged as a failure.
+shutdownTimeout: 5m
+gpuLabel: nvidia.com/gpu.present
+
+# Client certificate for the "talos" power-off method, typically a mounted Secret. Its role must
+# allow Shutdown: os:operator or os:admin.
+talos:
+  caFile: /etc/wol-provider/talos/ca.crt
+  certFile: /etc/wol-provider/talos/tls.crt
+  keyFile: /etc/wol-provider/talos/tls.key
+
+nodeGroups:
+  - id: gpu
+    minSize: 0
+    maxSize: 1
+    # What a node of this group looks like when it registers, so Cluster Autoscaler can scale it up
+    # from zero. Match the labels and taints the machine's kubelet registers with.
+    template:
+      labels:
+        nvidia.com/gpu.present: "true"
+      taints:
+        - key: example.com/gpu
+          value: "true"
+          effect: NoSchedule
+      capacity:
+        cpu: "16"
+        memory: 64Gi
+        pods: "110"
+        nvidia.com/gpu: "1"
+    machines:
+      - node: node-a
+        powerOn: wol
+        mac: "00:00:5e:00:53:01"
+        # The subnet's broadcast address. From a pod, use hostNetwork on a node in the same subnet,
+        # or a directed broadcast the router forwards.
+        broadcast: "192.0.2.255:9"
+        powerOff: talos
+        talosEndpoint: "192.0.2.11:50000"
+
+  - id: batch
+    minSize: 0
+    maxSize: 2
+    machines:
+      - node: node-b
+        powerOn: wol
+        mac: "00:00:5e:00:53:02"
+        broadcast: "192.0.2.255:9"
+        powerOff: talos
+        talosEndpoint: "192.0.2.12:50000"
+      - node: node-c
+        powerOn: wol
+        mac: "00:00:5e:00:53:03"
+        broadcast: "192.0.2.255:9"
+        # Not implemented yet: DeleteNodes fails for this machine until it is.
+        powerOff: ssh
