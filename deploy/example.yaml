@@ -1,0 +1,129 @@
+# Example manifests: the provider, and the parts of a Cluster Autoscaler deployment that point at it.
+# Install Cluster Autoscaler itself from its Helm chart or manifests; see README.md.
+# Names, namespaces and addresses are examples.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wol-provider
+  namespace: kube-system
+---
+# The provider removes the Node object of a machine it has powered off, so the node doesn't sit
+# NotReady; the kubelet registers it again on the next boot.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wol-provider
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wol-provider
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wol-provider
+subjects:
+  - kind: ServiceAccount
+    name: wol-provider
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wol-provider
+  namespace: kube-system
+data:
+  config.yaml: |
+    talos:
+      caFile: /etc/wol-provider/talos/ca.crt
+      certFile: /etc/wol-provider/talos/tls.crt
+      keyFile: /etc/wol-provider/talos/tls.key
+    nodeGroups:
+      - id: gpu
+        minSize: 0
+        maxSize: 1
+        machines:
+          - node: node-a
+            powerOn: wol
+            mac: "00:00:5e:00:53:01"
+            broadcast: "192.0.2.255:9"
+            powerOff: talos
+            talosEndpoint: "192.0.2.11:50000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wol-provider
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: wol-provider}
+  template:
+    metadata:
+      labels: {app: wol-provider}
+    spec:
+      serviceAccountName: wol-provider
+      # A broadcast only reaches the subnet the sender is on: run on a node in the machines' subnet.
+      # With a directed broadcast the router forwards, hostNetwork isn't needed.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Never on a machine this provider can power off.
+      nodeSelector:
+        example.com/always-on: "true"
+      containers:
+        - name: wol-provider
+          image: ghcr.io/oldsj/cluster-autoscaler-wol-provider:latest # pin a version or digest
+          args:
+            - --config=/etc/wol-provider/config.yaml
+            - --listen=:8086
+            - --dry-run # remove once the logs show the decisions you expect
+          ports:
+            - {name: grpc, containerPort: 8086}
+          readinessProbe:
+            grpc: {port: 8086}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/wol-provider, readOnly: true}
+            - {name: talos, mountPath: /etc/wol-provider/talos, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: wol-provider}
+        # ca.crt, tls.crt and tls.key of a Talos client certificate with role os:operator.
+        - name: talos
+          secret: {secretName: wol-provider-talos}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wol-provider
+  namespace: kube-system
+spec:
+  selector: {app: wol-provider}
+  ports:
+    - {name: grpc, port: 8086, targetPort: grpc}
+---
+# Cluster Autoscaler's cloud config: run it with
+#   --cloud-provider=externalgrpc --cloud-config=/etc/cluster-autoscaler/cloud-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-cloud-config
+  namespace: kube-system
+data:
+  cloud-config.yaml: |
+    address: wol-provider.kube-system.svc:8086
+    grpc_timeout: 30s
+    # For mTLS (recommended): key, cert and cacert, with the provider's --tls-* flags.
