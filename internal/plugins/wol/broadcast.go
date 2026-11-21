@@ -1,4 +1,6 @@
-package power
+//go:build unix
+
+package wol
 
 import (
 	"syscall"
