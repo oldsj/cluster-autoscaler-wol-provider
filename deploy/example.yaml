@@ -7,8 +7,9 @@ metadata:
   name: wol-provider
   namespace: kube-system
 ---
-# The provider removes the Node object of a machine it has powered off, so the node doesn't sit
-# NotReady; the kubelet registers it again on the next boot.
+# The provider reads nodes; patches a matched node's empty spec.providerID (once: the API server
+# refuses any later change); and removes the Node object of a machine it has powered off, so the
+# node doesn't sit NotReady (the kubelet registers it again on the next boot).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -16,7 +17,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [nodes]
-    verbs: [get, list, watch, delete]
+    verbs: [get, list, watch, patch, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -77,7 +78,7 @@ spec:
         example.com/always-on: "true"
       containers:
         - name: wol-provider
-          image: ghcr.io/oldsj/cluster-autoscaler-wol-provider:latest # pin a version or digest
+          image: ghcr.io/oldsj/cluster-autoscaler-wol-provider:0.2.0 # or pin the digest
           args:
             - --config=/etc/wol-provider/config.yaml
             - --listen=:8086

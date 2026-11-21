@@ -6,6 +6,42 @@ delete machines: when Cluster Autoscaler grows a node group, it wakes one of the
 powered-off machines with Wake-on-LAN; when it shrinks one, it powers the machine off through its
 operating system.
 
+## Why
+
+Home labs and small on-prem clusters are sized for their busiest hour and sit idle most of the day.
+Consumer and prosumer machines idle at roughly 30–100 W each, around the clock. A single 100 W idle
+node uses about 876 kWh a year: roughly $130 at $0.15/kWh, mostly spent doing nothing.
+
+In the cloud, Cluster Autoscaler fixes this by deleting idle instances and creating new ones on
+demand. On bare metal you can't create machines, but you can turn them off and back on. This
+provider gives Cluster Autoscaler exactly that: a node group is a fixed set of real machines, "scale
+up" powers one on, and "scale down" drains it and powers it off. Node groups can go all the way to
+zero.
+
+That works because cold boots are fast now. On an ordinary consumer desktop, with the Kubernetes
+node running as a VM on a Windows host:
+
+| Step | Time after the magic packet |
+|------|-----------------------------|
+| Wake-on-LAN sent | 0 s |
+| Operating system up | ~43 s |
+| Node Ready | ~89 s |
+| First pod Ready | ~110 s |
+
+That measurement includes a 30 s VM autostart delay, so bare metal or a setup without the delay lands
+around 80 s, and a plain Linux install is faster still. It fits easily inside Cluster Autoscaler's
+provisioning window, and it's fine for CI, batch jobs, media transcoding, model inference and other
+on-demand apps. Pair it with [KEDA](https://keda.sh) scale-to-zero for HTTP apps.
+
+The shape this is built for: a small always-on core (the control plane plus one low-power node) runs
+Cluster Autoscaler and this provider, while the big, power-hungry machines sleep at zero until
+pending pods need them.
+
+Not a fit: latency-critical services pinned to sleeping nodes, or nodes that hold storage replicas or
+quorum members you can't lose for a few minutes.
+
+## What it does
+
 Cluster Autoscaler still makes every decision: which pending pods need a node, which node group
 fits them (including scale-up from zero, from a template), which node is unneeded, draining it,
 PodDisruptionBudgets, scale-down delays. This provider only switches machines on and off.
@@ -15,8 +51,10 @@ PodDisruptionBudgets, scale-down delays. This provider only switches machines on
 
 ## How it works
 
-- **Node groups** are static lists of existing machines in a YAML file. Each machine names the
-  node it registers as, how to power it on (`wol`) and off (`talos`; `ssh` is planned).
+- **Node groups** are static lists of existing machines in a YAML file. Each machine is matched to
+  its node by name (`node`) or by labels (`nodeSelector`), and says how to power it on (`wol`) and
+  off (`talos`; `ssh` is planned).
+- **Provider IDs** are set by the provider: see [Provider IDs](#provider-ids).
 - **Target size** is the number of the group's machines that are running (their Node object
   exists) or starting (woken less than `bootTimeout` ago).
 - **Scale up** (`NodeGroupIncreaseSize`) sends a magic packet to the next powered-off machine, in
@@ -38,11 +76,6 @@ provider goes by the Node objects alone.
 
 ### Requirements
 
-- **Provider IDs.** Cluster Autoscaler matches nodes to instances by `spec.providerID`. Each node
-  must register with `providerIDPrefix` + its node name (default `wol://<node>`), set with the
-  kubelet's `--provider-id`. A node's provider ID can only be set when it registers, so an existing
-  node has to be deleted and register again after the flag is added. If a node registers with some
-  other provider ID, the provider reports that ID for it instead.
 - **Wake-on-LAN** enabled in each machine's firmware and network card, for the power state it's
   shut down into (S5).
 - **A broadcast that reaches the machines.** A broadcast doesn't cross subnets: run the provider
@@ -53,12 +86,32 @@ provider goes by the Node objects alone.
   Secret) whose role may call Shutdown, `os:operator` or `os:admin`, and each machine's Talos API
   endpoint. Generate one with `talosctl config new --roles os:operator`.
 
+### Provider IDs
+
+Cluster Autoscaler matches nodes to instances by `spec.providerID`. Nodes on machines you own
+usually register without one, so the provider sets it: on every refresh, each machine's matched node
+whose `spec.providerID` is empty gets `providerIDPrefix` + the machine's name (`wol://<name>`; the
+name defaults to the node name). No kubelet flag, no re-registration.
+
+- The API server lets a node's `spec.providerID` go from empty to a value once, and refuses any
+  later change (`node updates may not change providerID except from "" to valid`). The provider
+  can't overwrite an ID something else set; CI checks this rule against a real API server.
+- A node that already has a provider ID (set by its kubelet, a cloud controller, or Talos) keeps it.
+  Give that value as the machine's `providerID` and the provider uses it as-is; without that it
+  still uses the node's ID, and logs a warning.
+- When the provider deletes a powered-off machine's Node object, the kubelet registers it again
+  with an empty ID on the next boot, and the provider sets it again.
+- `assignProviderIDs: false` turns this off. It's on in `--dry-run` too, since it switches nothing
+  on or off and Cluster Autoscaler can't match nodes without it.
+- It needs `patch` on nodes; see the ClusterRole in [`deploy/example.yaml`](deploy/example.yaml)
+  (`get`, `list`, `watch`, `patch`, `delete` on `nodes`).
+
 ## Configuration
 
 See [`examples/config.yaml`](examples/config.yaml). In short:
 
 ```yaml
-providerIDPrefix: wol://   # instance ID = prefix + node name
+providerIDPrefix: wol://   # instance ID = prefix + machine name, set on the node (see above)
 bootTimeout: 15m           # keep Cluster Autoscaler's --max-node-provision-time at or below this
 shutdownTimeout: 5m        # a machine still Ready this long after power-off is logged as a failure
 talos: {caFile: ..., certFile: ..., keyFile: ...}
@@ -93,8 +146,10 @@ Flags:
 ## Running it next to Cluster Autoscaler
 
 1. Deploy the provider: [`deploy/example.yaml`](deploy/example.yaml) has a ServiceAccount allowed to
-   list and delete nodes, the config, the Talos certificate Secret mount, a Deployment and a Service.
-   Build the image from this repository (`docker build .`) until releases are published.
+   list, patch and delete nodes, the config, the Talos certificate Secret mount, a Deployment and a
+   Service. Images for linux/amd64 and linux/arm64 are at
+   `ghcr.io/oldsj/cluster-autoscaler-wol-provider`: `X.Y.Z` and `X.Y` from release tags, `main` and
+   `sha-<commit>` from the main branch.
 2. Run upstream Cluster Autoscaler with:
 
    ```
@@ -139,7 +194,6 @@ them.
 ## Planned
 
 - `ssh` power-off, for hosts that aren't Talos (for example a hypervisor running Windows).
-- Published multi-arch images and releases.
 - Optional confirmation before a power-off (a hook that must approve it).
 
 ## License

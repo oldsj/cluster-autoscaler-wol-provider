@@ -29,6 +29,9 @@ import (
 	pb "github.com/oldsj/cluster-autoscaler-wol-provider/proto/externalgrpc"
 )
 
+// version is set at build time (-ldflags -X main.version=...).
+var version = "dev"
+
 func main() {
 	var (
 		configPath = flag.String("config", "/etc/wol-provider/config.yaml", "provider configuration file")
@@ -101,7 +104,7 @@ func run(log *slog.Logger, configPath, listen string, dryRun bool, kubeconfig, c
 	for _, g := range cfg.NodeGroups {
 		groups = append(groups, g.ID)
 	}
-	log.Info("serving", "listen", listen, "dryRun", dryRun, "groups", groups, "tls", len(opts) > 0)
+	log.Info("serving", "version", version, "listen", listen, "dryRun", dryRun, "groups", groups, "tls", len(opts) > 0)
 	return server.Serve(lis)
 }
 
