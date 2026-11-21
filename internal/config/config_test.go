@@ -41,6 +41,9 @@ func TestInvalid(t *testing.T) {
 		"duplicate node":  {"nodeGroups:\n  - {id: g, maxSize: 1, machines: [" + machineA + "]}\n  - {id: h, maxSize: 1, machines: [" + machineA + "]}", "more than one"},
 		"duplicate group": {"nodeGroups:\n  - {id: g, maxSize: 0, machines: [" + machineA + "]}\n  - {id: g, maxSize: 0, machines: [{node: b, powerOn: wol, mac: \"00:00:5e:00:53:02\", powerOff: ssh}]}", "twice"},
 		"bad capacity":    {"nodeGroups:\n  - {id: g, maxSize: 1, template: {capacity: {cpu: lots}}, machines: [" + machineA + "]}", "capacity"},
+		"no node":         {"nodeGroups:\n  - {id: g, maxSize: 1, machines: [{powerOn: wol, mac: \"00:00:5e:00:53:01\", powerOff: ssh}]}", "node or nodeSelector"},
+		"node and sel":    {"nodeGroups:\n  - {id: g, maxSize: 1, machines: [{node: n, nodeSelector: {a: b}, powerOn: wol, mac: \"00:00:5e:00:53:01\", powerOff: ssh}]}", "not both"},
+		"sel no name":     {"nodeGroups:\n  - {id: g, maxSize: 1, machines: [{nodeSelector: {a: b}, powerOn: wol, mac: \"00:00:5e:00:53:01\", powerOff: ssh}]}", "name is required"},
 		"bad duration":    {"bootTimeout: 5\nnodeGroups:\n  - {id: g, maxSize: 1, machines: [" + machineA + "]}", "duration"},
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"strings"
+	"sort"
 	"sync"
 	"time"
 
@@ -56,6 +56,11 @@ type machine struct {
 	spec   config.Machine
 	wokeAt time.Time
 	offAt  time.Time
+	// node is the name of the Node object matched to the machine at the last refresh; empty if none.
+	node string
+	// warned is the last warning logged about the machine's node, so a lasting condition is logged
+	// once, not on every refresh.
+	warned string
 }
 
 // Provider is the CloudProvider gRPC service.
@@ -70,7 +75,7 @@ type Provider struct {
 	now    func() time.Time
 
 	mu        sync.Mutex
-	machines  map[string]*machine // by node name
+	machines  map[string]*machine // by machine name
 	groups    map[string]*config.NodeGroup
 	snapshot  map[string]kube.Node
 	refreshed time.Time
@@ -100,7 +105,7 @@ func New(o Options) *Provider {
 		g := &o.Config.NodeGroups[i]
 		p.groups[g.ID] = g
 		for _, m := range g.Machines {
-			p.machines[m.Node] = &machine{group: g, spec: m}
+			p.machines[m.Name] = &machine{group: g, spec: m}
 		}
 	}
 	return p
@@ -112,7 +117,7 @@ func (p *Provider) phase(m *machine) phase {
 	if !m.offAt.IsZero() {
 		return stopping
 	}
-	if _, ok := p.snapshot[m.spec.Node]; ok {
+	if m.node != "" {
 		return running
 	}
 	if !m.wokeAt.IsZero() && p.now().Sub(m.wokeAt) < p.cfg.BootTimeout.Duration {
@@ -130,17 +135,19 @@ func (p *Provider) refresh(ctx context.Context) error {
 	}
 	p.snapshot = nodes
 	p.refreshed = p.now()
+	p.resolve(ctx)
 	for _, name := range p.order() {
 		m := p.machines[name]
-		node, exists := nodes[name]
+		node, exists := nodes[m.node]
+		exists = exists && m.node != ""
 		if !m.wokeAt.IsZero() {
 			switch {
 			case exists && node.Ready:
-				p.log.Info("node registered and Ready", "node", name, "group", m.group.ID,
+				p.log.Info("node registered and Ready", "machine", name, "group", m.group.ID,
 					"afterWake", p.now().Sub(m.wokeAt).Round(time.Second).String())
 				m.wokeAt = time.Time{}
 			case !exists && p.now().Sub(m.wokeAt) >= p.cfg.BootTimeout.Duration:
-				p.log.Warn("woken machine didn't register in time; counting it as off", "node", name,
+				p.log.Warn("woken machine didn't register in time; counting it as off", "machine", name,
 					"group", m.group.ID, "bootTimeout", p.cfg.BootTimeout.String())
 				m.wokeAt = time.Time{}
 			}
@@ -150,21 +157,22 @@ func (p *Provider) refresh(ctx context.Context) error {
 		}
 		switch {
 		case !exists:
-			p.log.Info("powered off, Node object gone", "node", name, "group", m.group.ID)
+			p.log.Info("powered off, Node object gone", "machine", name, "group", m.group.ID)
 			m.offAt = time.Time{}
 		case !node.Ready:
 			// The kubelet has stopped. The Node object would otherwise stay NotReady and count against
 			// the group; the kubelet registers it again when the machine next boots.
-			if err := p.nodes.Delete(ctx, name); err != nil {
-				p.log.Error("deleting Node object of powered-off machine", "node", name, "err", err)
+			if err := p.nodes.Delete(ctx, m.node); err != nil {
+				p.log.Error("deleting Node object of powered-off machine", "machine", name, "node", m.node, "err", err)
 				continue
 			}
-			p.log.Info("powered off; deleted its Node object", "node", name, "group", m.group.ID,
+			p.log.Info("powered off; deleted its Node object", "machine", name, "node", m.node, "group", m.group.ID,
 				"afterPowerOff", p.now().Sub(m.offAt).Round(time.Second).String())
-			delete(p.snapshot, name)
+			delete(p.snapshot, m.node)
+			m.node = ""
 			m.offAt = time.Time{}
 		case p.now().Sub(m.offAt) >= p.cfg.ShutdownTimeout.Duration:
-			p.log.Error("machine still Ready after power-off; counting it as running", "node", name,
+			p.log.Error("machine still Ready after power-off; counting it as running", "machine", name,
 				"group", m.group.ID, "shutdownTimeout", p.cfg.ShutdownTimeout.String())
 			m.offAt = time.Time{}
 		}
@@ -179,21 +187,111 @@ func (p *Provider) refreshIfStale(ctx context.Context) error {
 	return p.refresh(ctx)
 }
 
-// order is every machine's node name, in config order.
+// order is every machine's name, in config order.
 func (p *Provider) order() []string {
 	var names []string
 	for _, g := range p.cfg.NodeGroups {
 		for _, m := range g.Machines {
-			names = append(names, m.Node)
+			names = append(names, m.Name)
 		}
 	}
 	return names
 }
 
+// instanceID is the ID Cluster Autoscaler knows the machine by: its configured providerID, or the
+// prefix and its name.
+func (p *Provider) instanceID(m *machine) string {
+	if m.spec.ProviderID != "" {
+		return m.spec.ProviderID
+	}
+	return p.cfg.ProviderIDPrefix + m.spec.Name
+}
+
+// warn logs a condition about a machine once, until a different one is logged.
+func (p *Provider) warn(m *machine, msg string, args ...any) {
+	if m.warned == msg {
+		return
+	}
+	m.warned = msg
+	p.log.Warn(msg, append([]any{"machine", m.spec.Name, "group", m.group.ID}, args...)...)
+}
+
+// resolve matches each machine to its Node object, by name or by label selector, and sets the
+// node's providerID when it's empty.
+func (p *Provider) resolve(ctx context.Context) {
+	claimed := map[string]string{} // node name -> machine name
+	for _, name := range p.order() {
+		m := p.machines[name]
+		m.node = ""
+		var matches []string
+		if m.spec.Node != "" {
+			if _, ok := p.snapshot[m.spec.Node]; ok {
+				matches = []string{m.spec.Node}
+			}
+		} else {
+			for n, node := range p.snapshot {
+				if selects(m.spec.NodeSelector, node.Labels) {
+					matches = append(matches, n)
+				}
+			}
+			sort.Strings(matches)
+		}
+		switch {
+		case len(matches) == 0:
+			continue
+		case len(matches) > 1:
+			p.warn(m, "nodeSelector matches more than one node; treating the machine as unmatched", "nodes", matches)
+			continue
+		}
+		if other, ok := claimed[matches[0]]; ok {
+			p.warn(m, "node already matched to another machine; treating this one as unmatched", "node", matches[0], "other", other)
+			continue
+		}
+		claimed[matches[0]] = name
+		m.node = matches[0]
+		p.assignProviderID(ctx, m)
+	}
+}
+
+func selects(selector, labels map[string]string) bool {
+	for k, v := range selector {
+		if got, ok := labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	return true
+}
+
+// assignProviderID sets the machine's instance ID as its node's spec.providerID when that's empty.
+// The API server allows this once, from empty to a value; it refuses any later change.
+func (p *Provider) assignProviderID(ctx context.Context, m *machine) {
+	node := p.snapshot[m.node]
+	want := p.instanceID(m)
+	switch {
+	case node.ProviderID == want:
+		m.warned = ""
+	case node.ProviderID != "":
+		p.warn(m, "node already has another providerID; using it. Set the machine's providerID to it to make that explicit",
+			"node", m.node, "providerID", node.ProviderID, "expected", want)
+	case !*p.cfg.AssignProviderIDs:
+		p.warn(m, "node has no providerID and assignProviderIDs is false; Cluster Autoscaler can't match it to its instance",
+			"node", m.node, "expected", want)
+	default:
+		if err := p.nodes.SetProviderID(ctx, m.node, want); err != nil {
+			p.log.Error("setting providerID; retrying on the next refresh", "machine", m.spec.Name, "node", m.node,
+				"providerID", want, "err", err)
+			return
+		}
+		node.ProviderID = want
+		p.snapshot[m.node] = node
+		p.log.Info("set node providerID", "machine", m.spec.Name, "node", m.node, "providerID", want, "dryRun", p.dryRun)
+	}
+}
+
 func (p *Provider) inGroup(g *config.NodeGroup, want ...phase) []*machine {
 	var out []*machine
 	for _, spec := range g.Machines {
-		m := p.machines[spec.Node]
+		m := p.machines[spec.Name]
 		ph := p.phase(m)
 		for _, w := range want {
 			if ph == w {
@@ -217,17 +315,27 @@ func (p *Provider) group(id string) (*config.NodeGroup, error) {
 	return g, nil
 }
 
-// machineFor finds the machine behind a node Cluster Autoscaler names, by provider ID or by name.
+// machineFor finds the machine behind a node Cluster Autoscaler names: by provider ID, then by the
+// node it was matched to, then by its configured node name.
 func (p *Provider) machineFor(n *pb.ExternalGrpcNode) *machine {
 	if n == nil {
 		return nil
 	}
-	if id, ok := strings.CutPrefix(n.GetProviderID(), p.cfg.ProviderIDPrefix); ok && id != "" {
-		if m, ok := p.machines[id]; ok {
-			return m
+	if id := n.GetProviderID(); id != "" {
+		for _, m := range p.machines {
+			if id == p.instanceID(m) || (m.node != "" && p.snapshot[m.node].ProviderID == id) {
+				return m
+			}
 		}
 	}
-	return p.machines[n.GetName()]
+	if name := n.GetName(); name != "" {
+		for _, m := range p.machines {
+			if m.node == name || (m.node == "" && m.spec.Node == name) {
+				return m
+			}
+		}
+	}
+	return nil
 }
 
 func (p *Provider) pbGroup(g *config.NodeGroup) *pb.NodeGroup {
@@ -320,16 +428,16 @@ func (p *Provider) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupI
 	}
 	for _, m := range candidates[:delta] {
 		if p.dryRun {
-			p.log.Info("dry-run: would wake machine", "node", m.spec.Node, "group", g.ID, "method", m.spec.PowerOn,
+			p.log.Info("dry-run: would wake machine", "machine", m.spec.Name, "group", g.ID, "method", m.spec.PowerOn,
 				"broadcast", m.spec.Broadcast)
 			continue
 		}
 		if err := p.power.PowerOn(ctx, m.spec); err != nil {
-			p.log.Error("wake failed", "node", m.spec.Node, "group", g.ID, "err", err)
+			p.log.Error("wake failed", "machine", m.spec.Name, "group", g.ID, "err", err)
 			return nil, status.Errorf(codes.Internal, "waking %s: %v", m.spec.Node, err)
 		}
 		m.wokeAt = p.now()
-		p.log.Info("woke machine", "node", m.spec.Node, "group", g.ID, "method", m.spec.PowerOn)
+		p.log.Info("woke machine", "machine", m.spec.Name, "group", g.ID, "method", m.spec.PowerOn)
 	}
 	if p.dryRun {
 		return nil, errDryRun
@@ -361,37 +469,37 @@ func (p *Provider) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDe
 		return nil, status.Errorf(codes.FailedPrecondition, "%s: size %d - %d is under min %d", g.ID, size, len(targets), g.MinSize)
 	}
 	for _, m := range targets {
-		name := m.spec.Node
-		node := p.snapshot[name]
+		name := m.spec.Name
+		node := p.snapshot[m.node]
 		switch ph := p.phase(m); {
 		case ph == off || ph == stopping:
-			p.log.Info("already off or powering off", "node", name, "group", g.ID, "phase", ph.String())
+			p.log.Info("already off or powering off", "machine", name, "group", g.ID, "phase", ph.String())
 		case ph == creating:
 			if p.dryRun {
-				p.log.Info("dry-run: would stop counting a starting machine", "node", name, "group", g.ID)
+				p.log.Info("dry-run: would stop counting a starting machine", "machine", name, "group", g.ID)
 				continue
 			}
 			// It can't be un-woken. If it boots anyway, it registers and is scaled down like any node.
-			p.log.Warn("stopped counting a machine that hasn't registered; it may still boot", "node", name, "group", g.ID)
+			p.log.Warn("stopped counting a machine that hasn't registered; it may still boot", "machine", name, "group", g.ID)
 			m.wokeAt = time.Time{}
 		case !node.Ready:
 			if p.dryRun {
-				p.log.Info("dry-run: would delete the Node object of a NotReady machine (no power-off)", "node", name, "group", g.ID)
+				p.log.Info("dry-run: would delete the Node object of a NotReady machine (no power-off)", "machine", name, "group", g.ID)
 				continue
 			}
-			p.log.Info("node NotReady; skipping power-off, removing its Node object", "node", name, "group", g.ID)
+			p.log.Info("node NotReady; skipping power-off, removing its Node object", "machine", name, "group", g.ID)
 			m.offAt = p.now()
 		default:
 			if p.dryRun {
-				p.log.Info("dry-run: would power off machine", "node", name, "group", g.ID, "method", m.spec.PowerOff)
+				p.log.Info("dry-run: would power off machine", "machine", name, "group", g.ID, "method", m.spec.PowerOff)
 				continue
 			}
 			if err := p.power.PowerOff(ctx, m.spec); err != nil {
-				p.log.Error("power-off failed", "node", name, "group", g.ID, "method", m.spec.PowerOff, "err", err)
+				p.log.Error("power-off failed", "machine", name, "group", g.ID, "method", m.spec.PowerOff, "err", err)
 				return nil, status.Errorf(codes.Internal, "powering off %s: %v", name, err)
 			}
 			m.offAt = p.now()
-			p.log.Info("powering off machine", "node", name, "group", g.ID, "method", m.spec.PowerOff)
+			p.log.Info("powering off machine", "machine", name, "group", g.ID, "method", m.spec.PowerOff)
 		}
 	}
 	if p.dryRun {
@@ -430,7 +538,7 @@ func (p *Provider) NodeGroupDecreaseTargetSize(ctx context.Context, req *pb.Node
 			}
 		}
 		m := starting[latest]
-		p.log.Info("stopped counting a starting machine", "node", m.spec.Node, "group", g.ID)
+		p.log.Info("stopped counting a starting machine", "machine", m.spec.Name, "group", g.ID)
 		m.wokeAt = time.Time{}
 		starting = append(starting[:latest], starting[latest+1:]...)
 	}
@@ -455,8 +563,8 @@ func (p *Provider) NodeGroupNodes(ctx context.Context, req *pb.NodeGroupNodesReq
 			creating: pb.InstanceStatus_instanceCreating,
 			stopping: pb.InstanceStatus_instanceDeleting,
 		}[p.phase(m)]
-		id := p.cfg.ProviderIDPrefix + m.spec.Node
-		if node, ok := p.snapshot[m.spec.Node]; ok && node.ProviderID != "" {
+		id := p.instanceID(m)
+		if node, ok := p.snapshot[m.node]; ok && m.node != "" && node.ProviderID != "" {
 			id = node.ProviderID
 		}
 		out.Instances = append(out.Instances, &pb.Instance{Id: id, Status: &pb.InstanceStatus{InstanceState: state}})

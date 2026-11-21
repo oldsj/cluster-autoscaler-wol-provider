@@ -1,8 +1,11 @@
 # Example provider configuration. Addresses are from the documentation ranges (RFC 5737, RFC 7042);
 # replace them with your own.
 
-# Instance ID = prefix + node name. Each node's spec.providerID must match (kubelet --provider-id).
+# Instance ID = prefix + machine name. The provider sets it as spec.providerID on each matched node
+# whose providerID is empty; no kubelet flag needed. A node that already has a providerID keeps it:
+# give that value as the machine's providerID.
 providerIDPrefix: wol://
+assignProviderIDs: true
 # How long a woken machine has to register before it stops counting as starting. Keep Cluster
 # Autoscaler's --max-node-provision-time at or below this.
 bootTimeout: 15m
@@ -55,7 +58,10 @@ nodeGroups:
         broadcast: "192.0.2.255:9"
         powerOff: talos
         talosEndpoint: "192.0.2.12:50000"
-      - node: node-c
+      # Matched by label instead of node name; the name is the machine's own (instance wol://box-c).
+      - name: box-c
+        nodeSelector:
+          example.com/machine: box-c
         powerOn: wol
         mac: "00:00:5e:00:53:03"
         broadcast: "192.0.2.255:9"

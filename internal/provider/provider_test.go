@@ -64,7 +64,28 @@ func (f *fakePower) PowerOff(_ context.Context, m config.Machine) error {
 type fakeNodes struct {
 	nodes   map[string]kube.Node
 	deleted []string
+	set     []string // "node=providerID"
 	listErr error
+	setErr  error
+}
+
+// SetProviderID behaves like the API server: empty to a value once, the same value again is a no-op,
+// any other change is refused.
+func (f *fakeNodes) SetProviderID(_ context.Context, name, id string) error {
+	if f.setErr != nil {
+		return f.setErr
+	}
+	n, ok := f.nodes[name]
+	switch {
+	case !ok:
+		return errors.New("not found")
+	case n.ProviderID != "" && n.ProviderID != id:
+		return errors.New("spec.providerID: Forbidden")
+	}
+	n.ProviderID = id
+	f.nodes[name] = n
+	f.set = append(f.set, name+"="+id)
+	return nil
 }
 
 func (f *fakeNodes) List(context.Context) (map[string]kube.Node, error) {
@@ -93,7 +114,12 @@ type harness struct {
 
 func newHarness(t *testing.T, dryRun bool, nodes map[string]kube.Node) *harness {
 	t.Helper()
-	cfg, err := config.Parse([]byte(testConfig))
+	return newHarnessWith(t, testConfig, dryRun, nodes)
+}
+
+func newHarnessWith(t *testing.T, yaml string, dryRun bool, nodes map[string]kube.Node) *harness {
+	t.Helper()
+	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +380,100 @@ func TestInstanceUsesRegisteredProviderID(t *testing.T) {
 	h := newHarness(t, false, map[string]kube.Node{"node-a": {Ready: true, ProviderID: "talos://metal/node-a"}})
 	if got := h.instances(t, "gpu"); got["talos://metal/node-a"] != pb.InstanceStatus_instanceRunning {
 		t.Fatalf("instances %v", got)
+	}
+}
+
+func TestAssignsEmptyProviderID(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		h := newHarness(t, dryRun, map[string]kube.Node{
+			"node-a": {Ready: true},
+			"node-b": {Ready: true, ProviderID: "talos://metal/node-b"},
+		})
+		h.tick(t, 0)
+		if len(h.nodes.set) != 1 || h.nodes.set[0] != "node-a=wol://node-a" {
+			t.Fatalf("dryRun %v: set %v", dryRun, h.nodes.set)
+		}
+		got := h.instances(t, "gpu")
+		if got["wol://node-a"] != pb.InstanceStatus_instanceRunning || got["talos://metal/node-b"] != pb.InstanceStatus_instanceRunning {
+			t.Fatalf("instances %v", got)
+		}
+		h.tick(t, time.Minute)
+		if len(h.nodes.set) != 1 {
+			t.Fatalf("set again: %v", h.nodes.set)
+		}
+	}
+}
+
+func TestAssignRetriesAfterError(t *testing.T) {
+	h := newHarness(t, false, map[string]kube.Node{"node-a": {Ready: true}})
+	h.nodes.setErr = errors.New("conflict")
+	h.tick(t, 0)
+	h.nodes.setErr = nil
+	h.tick(t, time.Minute)
+	if len(h.nodes.set) != 1 {
+		t.Fatalf("set %v", h.nodes.set)
+	}
+}
+
+func TestAssignDisabled(t *testing.T) {
+	h := newHarnessWith(t, "assignProviderIDs: false\n"+testConfig, false, map[string]kube.Node{"node-a": {Ready: true}})
+	h.tick(t, 0)
+	if len(h.nodes.set) != 0 {
+		t.Fatalf("set %v", h.nodes.set)
+	}
+}
+
+const selectorConfig = `
+nodeGroups:
+  - id: g
+    maxSize: 2
+    machines:
+      - {name: box-1, nodeSelector: {example.com/machine: box-1}, powerOn: wol, mac: "00:00:5e:00:53:01", powerOff: ssh}
+      - {name: box-2, node: node-x, providerID: "metal://rack/box-2", powerOn: wol, mac: "00:00:5e:00:53:02", powerOff: ssh}
+`
+
+func TestNodeSelectorAndProviderIDMapping(t *testing.T) {
+	h := newHarnessWith(t, selectorConfig, false, map[string]kube.Node{
+		"host-17": {Ready: true, Labels: map[string]string{"example.com/machine": "box-1"}},
+		"node-x":  {Ready: true, ProviderID: "metal://rack/box-2"},
+	})
+	h.tick(t, 0)
+	if len(h.nodes.set) != 1 || h.nodes.set[0] != "host-17=wol://box-1" {
+		t.Fatalf("set %v", h.nodes.set)
+	}
+	got := h.instances(t, "g")
+	if len(got) != 2 || got["wol://box-1"] != pb.InstanceStatus_instanceRunning || got["metal://rack/box-2"] != pb.InstanceStatus_instanceRunning {
+		t.Fatalf("instances %v", got)
+	}
+	ctx := context.Background()
+	for _, n := range []*pb.ExternalGrpcNode{node("host-17", ""), node("", "wol://box-1"), node("anything", "metal://rack/box-2")} {
+		r, _ := h.p.NodeGroupForNode(ctx, &pb.NodeGroupForNodeRequest{Node: n})
+		if r.NodeGroup.Id != "g" {
+			t.Errorf("%v: group %q", n, r.NodeGroup.Id)
+		}
+	}
+	// A power-off reaches the selector-matched node's Node object.
+	if _, err := h.p.NodeGroupDeleteNodes(ctx, &pb.NodeGroupDeleteNodesRequest{Id: "g", Nodes: []*pb.ExternalGrpcNode{node("host-17", "wol://box-1")}}); err != nil {
+		t.Fatal(err)
+	}
+	n := h.nodes.nodes["host-17"]
+	n.Ready = false
+	h.nodes.nodes["host-17"] = n
+	h.tick(t, time.Minute)
+	if len(h.nodes.deleted) != 1 || h.nodes.deleted[0] != "host-17" {
+		t.Fatalf("deleted %v", h.nodes.deleted)
+	}
+}
+
+func TestNodeSelectorAmbiguous(t *testing.T) {
+	l := map[string]string{"example.com/machine": "box-1"}
+	h := newHarnessWith(t, selectorConfig, false, map[string]kube.Node{
+		"host-1": {Ready: true, Labels: l},
+		"host-2": {Ready: true, Labels: l},
+	})
+	h.tick(t, 0)
+	if len(h.nodes.set) != 0 || h.target(t, "g") != 0 {
+		t.Fatalf("set %v target %d", h.nodes.set, h.target(t, "g"))
 	}
 }
 

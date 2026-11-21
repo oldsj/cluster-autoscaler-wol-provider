@@ -15,10 +15,14 @@ import (
 
 // Config is the whole configuration file.
 type Config struct {
-	// ProviderIDPrefix is prepended to a machine's node name to form its instance ID. Each node's
-	// spec.providerID must equal it (kubelet --provider-id), or Cluster Autoscaler can't match nodes
-	// to instances. Default "wol://".
+	// ProviderIDPrefix is prepended to a machine's name to form its instance ID, "wol://<name>" by
+	// default. Cluster Autoscaler matches nodes to instances by spec.providerID; the provider sets it
+	// on each matched node whose providerID is empty (see AssignProviderIDs).
 	ProviderIDPrefix string `json:"providerIDPrefix,omitempty"`
+	// AssignProviderIDs sets spec.providerID on a matched node whose providerID is empty. The API
+	// server allows that once: a providerID can go from empty to a value, never change after. It
+	// also happens with --dry-run, since it switches nothing on or off. Default true.
+	AssignProviderIDs *bool `json:"assignProviderIDs,omitempty"`
 	// GPULabel is the node label Cluster Autoscaler uses to recognise GPU nodes. Optional.
 	GPULabel string `json:"gpuLabel,omitempty"`
 	// BootTimeout is how long a woken machine may take to register as a node before it's no longer
@@ -63,8 +67,18 @@ type Template struct {
 
 // Machine is one physical or virtual machine and the node it registers as.
 type Machine struct {
-	// Node is the Kubernetes node name the machine registers as.
-	Node string `json:"node"`
+	// Name identifies the machine; its instance ID is ProviderIDPrefix + Name. Default: Node.
+	// Required with NodeSelector.
+	Name string `json:"name,omitempty"`
+	// Node is the Kubernetes node name the machine registers as. Set Node or NodeSelector.
+	Node string `json:"node,omitempty"`
+	// NodeSelector matches the machine's node by labels instead of by name; it must match at most
+	// one node.
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// ProviderID is the machine's instance ID when its node already has a spec.providerID (set by
+	// its kubelet or another controller): give that value here, and the provider uses it as-is.
+	// Empty means ProviderIDPrefix + Name.
+	ProviderID string `json:"providerID,omitempty"`
 	// PowerOn is the method used to start it: "wol".
 	PowerOn string `json:"powerOn"`
 	// PowerOff is the method used to stop it: "talos" or "ssh" (not implemented yet).
@@ -114,6 +128,10 @@ func Parse(b []byte) (*Config, error) {
 	if c.BootTimeout.Duration == 0 {
 		c.BootTimeout.Duration = 15 * time.Minute
 	}
+	if c.AssignProviderIDs == nil {
+		t := true
+		c.AssignProviderIDs = &t
+	}
 	if c.ShutdownTimeout.Duration == 0 {
 		c.ShutdownTimeout.Duration = 5 * time.Minute
 	}
@@ -129,6 +147,7 @@ func (c *Config) validate() error {
 	}
 	groups := map[string]bool{}
 	nodes := map[string]bool{}
+	names := map[string]bool{}
 	for i := range c.NodeGroups {
 		g := &c.NodeGroups[i]
 		if g.ID == "" {
@@ -153,15 +172,29 @@ func (c *Config) validate() error {
 		}
 		for j := range g.Machines {
 			m := &g.Machines[j]
-			if m.Node == "" {
-				return fmt.Errorf("node group %q machines[%d]: node is required", g.ID, j)
+			switch {
+			case m.Node == "" && len(m.NodeSelector) == 0:
+				return fmt.Errorf("node group %q machines[%d]: set node or nodeSelector", g.ID, j)
+			case m.Node != "" && len(m.NodeSelector) > 0:
+				return fmt.Errorf("node group %q machines[%d]: set node or nodeSelector, not both", g.ID, j)
+			case m.Name == "" && m.Node == "":
+				return fmt.Errorf("node group %q machines[%d]: name is required with nodeSelector", g.ID, j)
 			}
-			if nodes[m.Node] {
-				return fmt.Errorf("node %q is in more than one place", m.Node)
+			if m.Name == "" {
+				m.Name = m.Node
 			}
-			nodes[m.Node] = true
+			if names[m.Name] {
+				return fmt.Errorf("machine %q is in more than one place", m.Name)
+			}
+			names[m.Name] = true
+			if m.Node != "" {
+				if nodes[m.Node] {
+					return fmt.Errorf("node %q is in more than one place", m.Node)
+				}
+				nodes[m.Node] = true
+			}
 			if err := c.validateMachine(m); err != nil {
-				return fmt.Errorf("node %q: %w", m.Node, err)
+				return fmt.Errorf("machine %q: %w", m.Name, err)
 			}
 		}
 	}
