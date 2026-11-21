@@ -198,9 +198,9 @@ func (p *Provider) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDe
 			p.mu.Unlock()
 			return nil, status.Errorf(codes.Unavailable, "recording the power-off on node %s: %v", m.node, err)
 		}
-		node := p.snapshot[m.node]
+		up := p.snapshot[m.node].Ready || (m.probed && m.up)
 		m.offAt, m.powerOffRunning = now, true
-		jobs = append(jobs, job{m, m.target(), !(node.Ready || m.probed && m.up)})
+		jobs = append(jobs, job{m, m.target(), !up})
 	}
 	p.mu.Unlock()
 
