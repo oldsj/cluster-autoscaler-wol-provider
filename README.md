@@ -169,7 +169,8 @@ compromised node could claim to be another machine.
 - `http`: an HTTP request. `url` (required, a template), `method` (POST), `headers`, `headerFiles`
   (header values read from files on every request, for tokens in a mounted Secret), `body` (a
   template), `timeout` (10s), `caFile`. Any 2xx succeeds. Templates see `{{.Name}}` (machine),
-  `{{.Node}}`, `{{.Group}}` and `{{.Action}}` (`on`, `off` or `approve`).
+  `{{.Node}}`, `{{.Group}}`, `{{.Action}}` (`on`, `off` or `approve`) and `{{.DryRun}}` (`true` when
+  the provider runs `--dry-run`; only an approval is ever sent then).
 - `exec`: runs a command in the provider's container. `command` (required, a list; each item a
   template), `env`, `timeout` (60s). Exit status 0 succeeds. The image has no shell or tools: mount
   the program, or build an image from this one with it added.
@@ -325,10 +326,19 @@ clear its own annotation and remove taints, and can only delete a node it's powe
 
 With `--dry-run`, scale-up and scale-down are logged (`dry-run: would power on machine`,
 `dry-run: would power off machine`) and answered with an error, so Cluster Autoscaler rolls back:
-it backs the node group off for a while and removes its deletion taint from the node. **Cluster
-Autoscaler still drains a node before it asks to delete it**, so pods move even in dry-run. To
-watch decisions without any evictions, also run Cluster Autoscaler with
-`--scale-down-enabled=false`, and look at its own logs for the nodes it considers unneeded.
+it backs the node group off for a while and removes its deletion taint from the node.
+
+With `approval` configured, a dry-run scale-down still asks the hook, with `{{.DryRun}}` set to
+`true`, and logs its answer (`dry-run: approval answered`, with `answer` = `approved`, `denied` or
+`pending`), so the logs show the whole decision. Whatever the hook says, nothing is switched; a hook
+with side effects of its own should check `DryRun`. As for real, a request still pending after
+`wait` is checked again next time instead of asked anew.
+
+**Cluster Autoscaler still drains a node before it asks to delete it**, so pods move even in
+dry-run. To watch decisions without any evictions, run Cluster Autoscaler with a
+`--scale-down-unneeded-time` longer than the dry run (for example `8760h`): it logs which nodes are
+unneeded but never reaches a drain, nor the provider's scale-down. (`--scale-down-enabled=false`
+skips the whole scale-down pass, so it shows nothing.)
 
 ### Upgrading from 0.2
 

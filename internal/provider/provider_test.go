@@ -636,10 +636,12 @@ func TestProbe(t *testing.T) {
 type fakeApprover struct {
 	answers []plugin.Decision
 	tickets []string
+	dryRun  bool
 }
 
-func (f *fakeApprover) Approve(_ context.Context, _ plugin.Target, ticket string) (plugin.Decision, string, error) {
+func (f *fakeApprover) Approve(_ context.Context, t plugin.Target, ticket string) (plugin.Decision, string, error) {
 	f.tickets = append(f.tickets, ticket)
+	f.dryRun = t.DryRun
 	d := f.answers[0]
 	if len(f.answers) > 1 {
 		f.answers = f.answers[1:]
@@ -676,6 +678,25 @@ func TestApproval(t *testing.T) {
 			t.Fatal("powered off when denied")
 		}
 	})
+}
+
+// In dry-run the approval hook is asked (with DryRun set) and its answer logged, but nothing changes.
+func TestDryRunAsksApproval(t *testing.T) {
+	cfg := "approval: {http: {url: http://192.0.2.1/approve}, wait: 1ms, pollInterval: 5ms}\n" + testConfig
+	for _, d := range []plugin.Decision{plugin.Approved, plugin.Denied, plugin.Pending} {
+		a := &fakeApprover{answers: []plugin.Decision{d}}
+		h := newHarnessWith(t, cfg, true, map[string]kube.Node{"node-a": drained()}, withApprover(a))
+		wantCode(t, h.remove("gpu", node("node-a", "")), codes.FailedPrecondition)
+		if len(a.tickets) == 0 || !a.dryRun {
+			t.Fatalf("decision %v: approver asked %d times, dryRun %v", d, len(a.tickets), a.dryRun)
+		}
+		if got := h.logs.count("dry-run: approval answered"); got != 1 {
+			t.Fatalf("decision %v: %d answer logs", d, got)
+		}
+		if len(h.power.off)+len(h.nodes.deleted) != 0 || !h.nodes.nodes["node-a"].PowerOffAt.IsZero() {
+			t.Fatalf("decision %v: dry-run acted: off %v deleted %v", d, h.power.off, h.nodes.deleted)
+		}
+	}
 }
 
 // Review #14: Cluster Autoscaler's revert of a timed-out scale-up succeeds even when nothing is left.
