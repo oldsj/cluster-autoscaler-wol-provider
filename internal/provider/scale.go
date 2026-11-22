@@ -169,6 +169,13 @@ func (p *Provider) NodeGroupDeleteNodes(ctx context.Context, req *pb.NodeGroupDe
 				"plugin", m.spec.PowerOff.Name, "approval", p.approver != nil)
 		}
 		p.mu.Unlock()
+		// The approval hook is asked as it would be for real (with DryRun set in its templates), so a
+		// dry run shows the whole decision. Whatever it answers, nothing is switched.
+		if p.approver != nil {
+			for _, m := range toPowerOff {
+				p.log.Info("dry-run: approval answered", "machine", m.spec.Name, "group", g.ID, "answer", answerOf(p.approve(ctx, m)))
+			}
+		}
 		return nil, errDryRun
 	}
 	p.mu.Unlock()
@@ -269,6 +276,7 @@ func (p *Provider) approve(ctx context.Context, m *machine) error {
 			m.approvalTicket, m.approvalAt = "", time.Time{}
 		}
 		ticket, t := m.approvalTicket, m.target()
+		t.DryRun = p.dryRun
 		p.mu.Unlock()
 
 		d, next, err := p.approver.Approve(ctx, t, ticket)
@@ -303,6 +311,19 @@ func (p *Provider) approve(ctx context.Context, m *machine) error {
 			return status.Errorf(codes.Unavailable, "power-off of %s is awaiting approval: %v", t.Name, ctx.Err())
 		case <-time.After(a.PollInterval.Duration):
 		}
+	}
+}
+
+// answerOf names approve's result for the dry-run log: approved, denied, or pending (awaiting an
+// answer, or the hook couldn't be reached).
+func answerOf(err error) string {
+	switch status.Code(err) {
+	case codes.OK:
+		return "approved"
+	case codes.PermissionDenied:
+		return "denied"
+	default:
+		return "pending"
 	}
 }
 

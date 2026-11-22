@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -17,9 +18,10 @@ import (
 
 // Target names the machine a plugin acts on. Plugins may use it in templates.
 type Target struct {
-	Name  string // machine name; the instance ID is the provider ID prefix + Name
-	Node  string // node name, if known
-	Group string // node group ID
+	Name   string // machine name; the instance ID is the provider ID prefix + Name
+	Node   string // node name, if known
+	Group  string // node group ID
+	DryRun bool   // the provider runs --dry-run: nothing will be switched whatever the answer
 }
 
 // PowerOn starts one machine. It returns once the request is sent; the node registering confirms it.
@@ -108,7 +110,7 @@ func (tp Template) Render(t Target, extra map[string]string) (string, error) {
 	if tp.t == nil {
 		return "", nil
 	}
-	data := map[string]string{"Name": t.Name, "Node": t.Node, "Group": t.Group}
+	data := map[string]string{"Name": t.Name, "Node": t.Node, "Group": t.Group, "DryRun": strconv.FormatBool(t.DryRun)}
 	maps.Copy(data, extra)
 	var b strings.Builder
 	if err := tp.t.Execute(&b, data); err != nil {
